@@ -758,6 +758,20 @@ fn agent_name_from_known_package_path(path: &str) -> Option<String> {
             return Some(agent_label(Agent::Qwen).to_string());
         }
     }
+    // Package-root entrypoints (npm 0.28+): the bin is cli-entry.js at the
+    // package root, and workers run cli.js from ~/.qwen/updates/npm/...
+    // version directories. Standalone installs ship a <root>/qwen-code tree
+    // (bundled runtime plus lib/cli-entry.js and lib/cli.js), so the install
+    // directory itself — not a node_modules package — is the identity signal.
+    for window in components.windows(3) {
+        if window == ["@qwen-code", "qwen-code", "cli-entry"]
+            || window == ["@qwen-code", "qwen-code", "cli"]
+            || window == ["qwen-code", "lib", "cli-entry"]
+            || window == ["qwen-code", "lib", "cli"]
+        {
+            return Some(agent_label(Agent::Qwen).to_string());
+        }
+    }
     for window in components.windows(4) {
         if window == ["node_modules", "mastracode", "dist", "cli"] {
             return Some(agent_label(Agent::Mastracode).to_string());
@@ -1195,6 +1209,31 @@ mod tests {
                 "node.exe",
                 r"C:\Users\user\AppData\Roaming\npm\node_modules\@qwen-code\qwen-code\dist\index.js",
             ],
+            vec![
+                "/home/user/.local/lib/qwen-code/node/bin/node",
+                "/home/user/.local/lib/qwen-code/lib/cli-entry.js",
+            ],
+            vec!["node", "/home/user/.local/lib/qwen-code/lib/cli-entry.js"],
+            vec![
+                "/home/user/.local/lib/qwen-code/node/bin/node",
+                "--expose-gc",
+                "/home/user/.local/lib/qwen-code/lib/cli.js",
+            ],
+            vec![
+                r"C:\Users\user\.local\lib\qwen-code\node\node.exe",
+                r"C:\Users\user\.local\lib\qwen-code\lib\cli-entry.js",
+            ],
+            // npm 0.28+ layout: package-root cli-entry.js and workers from
+            // the ~/.qwen/updates version directory.
+            vec![
+                r"C:\Program Files\nodejs\node.exe",
+                r"C:\Program Files\nodejs\node_modules\@qwen-code\qwen-code\cli-entry.js",
+            ],
+            vec![
+                r"C:\Program Files\nodejs\node.exe",
+                "--expose-gc",
+                r"C:\Users\user\.qwen\updates\npm\4e4c6b66144379db\versions\0.28.4\node_modules\@qwen-code\qwen-code\cli.js",
+            ],
         ] {
             let job = crate::platform::ForegroundJob {
                 process_group_id: 123,
@@ -1205,6 +1244,67 @@ mod tests {
                 identify_agent_in_job(&job),
                 Some((Agent::Qwen, "qwen".to_string()))
             );
+        }
+    }
+
+    #[test]
+    fn identify_agent_in_job_detects_qwen_standalone_foreground_job() {
+        // Issue #3818 capture: the standalone launcher execs the bundled node
+        // with lib/cli-entry.js as the process group leader, and workers keep
+        // lib/cli.js in the same group.
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 783457,
+            processes: vec![
+                foreground_process(
+                    783457,
+                    "node",
+                    &[
+                        "/home/user/.local/lib/qwen-code/node/bin/node",
+                        "/home/user/.local/lib/qwen-code/lib/cli-entry.js",
+                    ],
+                ),
+                foreground_process(
+                    783477,
+                    "node",
+                    &[
+                        "/home/user/.local/lib/qwen-code/node/bin/node",
+                        "--expose-gc",
+                        "/home/user/.local/lib/qwen-code/lib/cli.js",
+                    ],
+                ),
+                foreground_process(
+                    784060,
+                    "MainThread",
+                    &[
+                        "node",
+                        "/home/user/.npm/_npx/c35ab75beed40a3c/node_modules/.bin/context7-mcp",
+                    ],
+                ),
+            ],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Qwen, "qwen".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_ignores_qwen_lookalike_paths() {
+        for script in [
+            "/home/user/src/qwen-code/scripts/cli-entry.js",
+            "/home/user/qwen-code-demo/lib/cli.js",
+            "/opt/qwen-code/lib/other.js",
+            "/home/user/lib/qwen-code/cli-entry.js",
+            r"C:\Users\user\node_modules\@qwen-code\qwen-code\tools\build.js",
+            r"C:\Users\user\@qwen-code\cli-entry.js",
+        ] {
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, "node", &["node", script])],
+            };
+
+            assert_eq!(identify_agent_in_job(&job), None, "script: {script}");
         }
     }
 
